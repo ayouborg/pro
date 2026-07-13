@@ -225,29 +225,105 @@ let state = {
 };
 let activeView = 'dashboard';
 let ready = false;
+let dbError = null; // holds a message shown in a banner if Supabase calls fail
 
-async function storageGet(key){
-  try{
-    const r = await window.storage.get(key, false);
-    return r ? JSON.parse(r.value) : null;
-  }catch(e){ return null; }
+/* ---------- Supabase REST client ---------- */
+const SUPABASE_URL = 'https://lroykroozexmngxqgifj.supabase.co/rest/v1/';
+const SUPABASE_KEY = 'sb_publishable_EJl-NY4m2QLH7UrylRx_Tw_TIKs_4KA';
+
+function sbHeaders(extra){
+  return Object.assign({
+    'apikey': SUPABASE_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_KEY,
+    'Content-Type': 'application/json'
+  }, extra||{});
 }
-async function storageSet(key, value){
-  try{ await window.storage.set(key, JSON.stringify(value), false); }
-  catch(e){ console.error('storage error', e); }
+async function sbRequest(method, table, query, body, prefer){
+  const url = SUPABASE_URL + table + (query ? ('?'+query) : '');
+  const res = await fetch(url, {
+    method,
+    headers: sbHeaders(prefer ? {'Prefer':prefer} : {}),
+    body: body!==undefined ? JSON.stringify(body) : undefined
+  });
+  if(!res.ok){
+    const txt = await res.text().catch(()=> '');
+    throw new Error(`Supabase ${method} ${table} → ${res.status}: ${txt.slice(0,200)}`);
+  }
+  if(res.status===204) return null;
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+const sbGet = (table, query='select=*') => sbRequest('GET', table, query);
+const sbInsert = (table, rows) => sbRequest('POST', table, '', rows, 'return=representation');
+const sbUpdate = (table, query, patch) => sbRequest('PATCH', table, query, patch, 'return=representation');
+const sbDelete = (table, query) => sbRequest('DELETE', table, query);
+const sbUpsert = (table, row, conflictCol) => sbRequest('POST', table, 'on_conflict='+conflictCol, row, 'resolution=merge-duplicates,return=representation');
+
+/* ---------- mapping: DB (snake_case) <-> JS state (camelCase) ---------- */
+function companyFromDb(r){
+  return {
+    raisonSociale:r.raison_sociale||'', formeJuridique:r.forme_juridique||'', capitalSocial:r.capital_social||'',
+    adresse:r.adresse||'', ice:r.ice||'', rc:r.rc||'', rcVille:r.rc_ville||'',
+    ifiscal:r.ifiscal||'', patente:r.patente||'', cnss:r.cnss||'', tel:r.tel||'', email:r.email||''
+  };
+}
+function companyToDb(c){
+  return {
+    id:1, raison_sociale:c.raisonSociale, forme_juridique:c.formeJuridique, capital_social:c.capitalSocial,
+    adresse:c.adresse, ice:c.ice, rc:c.rc, rc_ville:c.rcVille,
+    ifiscal:c.ifiscal, patente:c.patente, cnss:c.cnss, tel:c.tel, email:c.email
+  };
+}
+function clientFromDb(r){ return {id:r.id, nom:r.nom||'', ice:r.ice||'', if_:r.if_client||'', adresse:r.adresse||''}; }
+function clientToDb(c){ return {nom:c.nom, ice:c.ice, if_client:c.if_, adresse:c.adresse}; }
+
+function invoiceFromDb(r){
+  return {
+    id:r.id, number:r.number, date:r.date, echeance:r.echeance||'',
+    client:r.client||{nom:'',ice:'',if_:'',adresse:''}, lines:r.lines||[],
+    notes:r.notes||'', statut:r.statut, totalHT:Number(r.total_ht), totalTVA:Number(r.total_tva), totalTTC:Number(r.total_ttc)
+  };
+}
+function invoiceToDb(i){
+  return {
+    number:i.number, date:i.date, echeance:i.echeance||null,
+    client:i.client, lines:i.lines, notes:i.notes, statut:i.statut,
+    total_ht:i.totalHT, total_tva:i.totalTVA, total_ttc:i.totalTTC
+  };
+}
+function achatFromDb(r){
+  return {
+    id:r.id, fournisseur:r.fournisseur||'', ice:r.ice||'', num:r.num||'', date:r.date,
+    montantHT:Number(r.montant_ht), tva:Number(r.tva), montantTTC:Number(r.montant_ttc),
+    fichier:r.fichier||'', statut:r.statut
+  };
+}
+function achatToDb(a){
+  return {
+    fournisseur:a.fournisseur, ice:a.ice, num:a.num, date:a.date,
+    montant_ht:a.montantHT, tva:a.tva, montant_ttc:a.montantTTC,
+    fichier:a.fichier, statut:a.statut
+  };
 }
 
 async function loadAll(){
-  const [c, cl, inv, ach] = await Promise.all([
-    storageGet('factura-company'),
-    storageGet('factura-clients'),
-    storageGet('factura-invoices'),
-    storageGet('factura-achats'),
-  ]);
-  if(c) state.company = c;
-  if(cl) state.clients = cl;
-  if(inv) state.invoices = inv;
-  if(ach) state.achats = ach;
+  try{
+    const [c, cl, inv, ach] = await Promise.all([
+      sbGet('company_settings', 'select=*&id=eq.1'),
+      sbGet('clients', 'select=*&order=nom.asc'),
+      sbGet('invoices', 'select=*&order=date.desc'),
+      sbGet('achats', 'select=*&order=date.desc'),
+    ]);
+    if(c && c[0]) state.company = companyFromDb(c[0]);
+    else { await sbUpsert('company_settings', companyToDb(state.company), 'id'); }
+    state.clients = (cl||[]).map(clientFromDb);
+    state.invoices = (inv||[]).map(invoiceFromDb);
+    state.achats = (ach||[]).map(achatFromDb);
+    dbError = null;
+  }catch(e){
+    console.error(e);
+    dbError = "Connexion à la base de données impossible. Vérifiez que les tables Supabase sont créées (voir console) — l'application fonctionne en mode local temporaire.";
+  }
   ready = true;
 }
 
@@ -292,15 +368,32 @@ function escapeHtml(s){
 function render(){
   renderSidebar();
   const main = document.getElementById('main');
-  if(activeView==='dashboard'){ main.innerHTML = viewDashboard(); bindGlobalNavButtons(); }
+  let html = '';
+  if(activeView==='dashboard'){ html = viewDashboard(); }
   else if(activeView==='vente'){
-    if(venteMode==='form'){ main.innerHTML = viewVenteForm(); bindVenteForm(); }
-    else { main.innerHTML = viewVenteList(); bindVenteList(); }
+    html = venteMode==='form' ? viewVenteForm() : viewVenteList();
   }
-  else if(activeView==='achat'){ main.innerHTML = viewAchat(); bindAchat(); }
-  else if(activeView==='suivi'){ main.innerHTML = viewSuivi(); bindSuivi(); }
-  else if(activeView==='modele'){ main.innerHTML = viewModele(); bindGlobalNavButtons(); }
-  else if(activeView==='parametres'){ main.innerHTML = viewParametres(); bindParametres(); }
+  else if(activeView==='achat'){ html = viewAchat(); }
+  else if(activeView==='suivi'){ html = viewSuivi(); }
+  else if(activeView==='modele'){ html = viewModele(); }
+  else if(activeView==='parametres'){ html = viewParametres(); }
+
+  main.innerHTML = (dbError ? dbBanner() : '') + html;
+
+  if(activeView==='dashboard'){ bindGlobalNavButtons(); }
+  else if(activeView==='vente'){
+    if(venteMode==='form'){ bindVenteForm(); } else { bindVenteList(); }
+  }
+  else if(activeView==='achat'){ bindAchat(); }
+  else if(activeView==='suivi'){ bindSuivi(); }
+  else if(activeView==='modele'){ bindGlobalNavButtons(); }
+  else if(activeView==='parametres'){ bindParametres(); }
+}
+
+function dbBanner(){
+  return `<div class="no-print" style="background:var(--danger-soft); color:var(--danger); border:1px solid #fecaca; border-radius:8px; padding:12px 16px; margin-bottom:20px; font-size:13px;">
+    <strong>Connexion à la base de données indisponible.</strong> ${escapeHtml(dbError)}
+  </div>`;
 }
 
 function bindGlobalNavButtons(){
@@ -607,20 +700,28 @@ async function saveInvoice(){
   if(d.lines.every(l=>!l.designation.trim())){ alert("Ajoutez au moins une ligne de facturation."); return; }
   const t = computeTotals(d);
   const invoice = {
-    id: 'inv_'+Date.now(),
     number: d.number, date: d.date, echeance: d.echeance,
     client: {...d.client}, lines: d.lines.map(l=>({...l})),
     notes: d.notes, statut: d.statut,
     totalHT: t.totalHT, totalTVA: t.totalTVA, totalTTC: t.totalTTC
   };
-  state.invoices.push(invoice);
-  if(d.client.nom.trim() && !state.clients.some(c=>c.nom===d.client.nom)){
-    state.clients.push({...d.client});
-    await storageSet('factura-clients', state.clients);
+  const saveBtn = document.getElementById('btnSaveInvoice');
+  saveBtn.disabled = true; saveBtn.textContent = 'Enregistrement…';
+  try{
+    const rows = await sbInsert('invoices', [invoiceToDb(invoice)]);
+    invoice.id = rows[0].id;
+    state.invoices.push(invoice);
+    if(d.client.nom.trim() && !state.clients.some(c=>c.nom===d.client.nom)){
+      const crows = await sbInsert('clients', [clientToDb(d.client)]);
+      state.clients.push(clientFromDb(crows[0]));
+    }
+    venteMode = 'list';
+    render();
+  }catch(e){
+    console.error(e);
+    alert("Impossible d'enregistrer la facture dans la base de données. Vérifiez que la table 'invoices' existe dans Supabase.\n\n"+e.message);
+    saveBtn.disabled = false; saveBtn.textContent = 'Enregistrer la facture';
   }
-  await storageSet('factura-invoices', state.invoices);
-  venteMode = 'list';
-  render();
 }
 
 /* ============================================================
@@ -696,15 +797,20 @@ function openInvoiceModal(inv){
   document.getElementById('modalBg').addEventListener('click', e=>{ if(e.target.id==='modalBg') root.innerHTML=''; });
   document.getElementById('btnPrintInv').addEventListener('click', ()=> window.print());
   document.getElementById('statutPick').addEventListener('change', async e=>{
-    inv.statut = e.target.value;
-    await storageSet('factura-invoices', state.invoices);
-    render();
+    const newStatut = e.target.value;
+    try{
+      await sbUpdate('invoices', 'id=eq.'+inv.id, {statut:newStatut});
+      inv.statut = newStatut;
+      render();
+    }catch(err){ console.error(err); alert("Impossible de mettre à jour le statut.\n"+err.message); }
   });
   document.getElementById('btnDeleteInv').addEventListener('click', async ()=>{
     if(confirm('Supprimer définitivement cette facture ?')){
-      state.invoices = state.invoices.filter(i=>i.id!==inv.id);
-      await storageSet('factura-invoices', state.invoices);
-      root.innerHTML=''; render();
+      try{
+        await sbDelete('invoices', 'id=eq.'+inv.id);
+        state.invoices = state.invoices.filter(i=>i.id!==inv.id);
+        root.innerHTML=''; render();
+      }catch(err){ console.error(err); alert("Impossible de supprimer la facture.\n"+err.message); }
     }
   });
 }
@@ -786,7 +892,6 @@ function bindAchat(){
     const fileInput = document.getElementById('a_file');
     const fichier = fileInput.files[0] ? fileInput.files[0].name : '';
     const achat = {
-      id:'ach_'+Date.now(),
       fournisseur: fourn,
       ice: document.getElementById('a_ice').value.trim(),
       num: document.getElementById('a_num').value.trim(),
@@ -794,17 +899,27 @@ function bindAchat(){
       montantHT: ht, tva, montantTTC: ht*(1+tva/100),
       fichier, statut: document.getElementById('a_statut').value
     };
-    state.achats.push(achat);
-    await storageSet('factura-achats', state.achats);
-    achatFormOpen = false;
-    render();
+    save.disabled = true; save.textContent = 'Enregistrement…';
+    try{
+      const rows = await sbInsert('achats', [achatToDb(achat)]);
+      achat.id = rows[0].id;
+      state.achats.push(achat);
+      achatFormOpen = false;
+      render();
+    }catch(e){
+      console.error(e);
+      alert("Impossible d'enregistrer la facture d'achat. Vérifiez que la table 'achats' existe dans Supabase.\n\n"+e.message);
+      save.disabled = false; save.textContent = 'Enregistrer';
+    }
   });
   main_qsa('[data-del-achat]').forEach(b=>{
     b.addEventListener('click', async ()=>{
       if(confirm("Supprimer cette facture d'achat ?")){
-        state.achats = state.achats.filter(a=>a.id!==b.dataset.delAchat);
-        await storageSet('factura-achats', state.achats);
-        render();
+        try{
+          await sbDelete('achats', 'id=eq.'+b.dataset.delAchat);
+          state.achats = state.achats.filter(a=>a.id!==b.dataset.delAchat);
+          render();
+        }catch(e){ console.error(e); alert("Impossible de supprimer.\n"+e.message); }
       }
     });
   });
@@ -979,7 +1094,7 @@ function viewParametres(){
 function bindParametres(){
   bindGlobalNavButtons();
   document.getElementById('btnSaveCompany').addEventListener('click', async ()=>{
-    state.company = {
+    const newCompany = {
       raisonSociale: document.getElementById('p_rs').value.trim(),
       formeJuridique: document.getElementById('p_fj').value.trim(),
       capitalSocial: document.getElementById('p_cap').value.trim(),
@@ -993,11 +1108,20 @@ function bindParametres(){
       tel: document.getElementById('p_tel').value.trim(),
       email: document.getElementById('p_email').value.trim(),
     };
-    await storageSet('factura-company', state.company);
-    renderSidebar();
-    const tag = document.getElementById('savedTag');
-    tag.style.display='inline';
-    setTimeout(()=> tag.style.display='none', 1800);
+    const btn = document.getElementById('btnSaveCompany');
+    btn.disabled = true; btn.textContent = 'Enregistrement…';
+    try{
+      await sbUpsert('company_settings', companyToDb(newCompany), 'id');
+      state.company = newCompany;
+      renderSidebar();
+      const tag = document.getElementById('savedTag');
+      tag.style.display='inline';
+      setTimeout(()=> tag.style.display='none', 1800);
+    }catch(e){
+      console.error(e);
+      alert("Impossible d'enregistrer dans Supabase. Vérifiez que la table 'company_settings' existe.\n\n"+e.message);
+    }
+    btn.disabled = false; btn.textContent = 'Enregistrer';
   });
 }
 
