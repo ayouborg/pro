@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Factura — Module de facturation</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
@@ -186,7 +187,7 @@
 
     <nav id="navList"></nav>
 
-    <div class="sidebar-foot">Conforme CGI marocain<br>art. 145 &amp; 146</div>
+    <div class="sidebar-foot" id="sidebarFoot"></div>
   </aside>
 
   <main id="main"></main>
@@ -200,13 +201,18 @@
 ============================================================ */
 const TVA_RATES = [20, 14, 10, 7, 0];
 const VIEWS = [
-  {id:'dashboard', label:'Tableau de bord', ic:'&#9635;'},
-  {id:'vente', label:'Facture de vente', ic:'&#128196;'},
-  {id:'achat', label:"GED — Factures d'achat", ic:'&#128193;'},
-  {id:'suivi', label:'Suivi des factures', ic:'&#9776;'},
-  {id:'modele', label:'Modèle de facture', ic:'&#9638;'},
-  {id:'parametres', label:'Paramètres société', ic:'&#9881;'},
+  {id:'dashboard', label:'Tableau de bord', ic:'&#9635;', roles:['admin','accountant','client']},
+  {id:'vente', label:'Facture de vente', ic:'&#128196;', roles:['admin','client']},
+  {id:'achat', label:"GED — Factures d'achat", ic:'&#128193;', roles:['admin','accountant']},
+  {id:'suivi', label:'Suivi des factures', ic:'&#9776;', roles:['admin','accountant','client']},
+  {id:'modele', label:'Modèle de facture', ic:'&#9638;', roles:['admin','accountant','client']},
+  {id:'parametres', label:'Paramètres société', ic:'&#9881;', roles:['admin']},
 ];
+function viewsForRole(role){
+  return VIEWS
+    .filter(v => v.roles.includes(role))
+    .map(v => (v.id==='vente' && role==='client') ? {...v, label:'Mes factures'} : v);
+}
 
 const defaultCompany = {
   raisonSociale:'ATLAS DISTRIBUTION SARL',
@@ -227,14 +233,22 @@ let activeView = 'dashboard';
 let ready = false;
 let dbError = null; // holds a message shown in a banner if Supabase calls fail
 
-/* ---------- Supabase REST client ---------- */
+/* ---------- Supabase REST + Auth client ---------- */
 const SUPABASE_URL = 'https://lroykroozexmngxqgifj.supabase.co/rest/v1/';
+const SUPABASE_AUTH_URL = 'https://lroykroozexmngxqgifj.supabase.co/auth/v1/';
 const SUPABASE_KEY = 'sb_publishable_EJl-NY4m2QLH7UrylRx_Tw_TIKs_4KA';
+
+let authState = {
+  accessToken: null,
+  user: null,       // {id, email}
+  profile: null,    // {id, role, client_id, full_name, email}
+  myClient: null    // full client row, only populated for role==='client'
+};
 
 function sbHeaders(extra){
   return Object.assign({
     'apikey': SUPABASE_KEY,
-    'Authorization': 'Bearer ' + SUPABASE_KEY,
+    'Authorization': 'Bearer ' + (authState.accessToken || SUPABASE_KEY),
     'Content-Type': 'application/json'
   }, extra||{});
 }
@@ -280,14 +294,14 @@ function clientToDb(c){ return {nom:c.nom, ice:c.ice, if_client:c.if_, adresse:c
 function invoiceFromDb(r){
   return {
     id:r.id, number:r.number, date:r.date, echeance:r.echeance||'',
-    client:r.client||{nom:'',ice:'',if_:'',adresse:''}, lines:r.lines||[],
+    client:r.client||{nom:'',ice:'',if_:'',adresse:''}, clientId:r.client_id||null, lines:r.lines||[],
     notes:r.notes||'', statut:r.statut, totalHT:Number(r.total_ht), totalTVA:Number(r.total_tva), totalTTC:Number(r.total_ttc)
   };
 }
 function invoiceToDb(i){
   return {
     number:i.number, date:i.date, echeance:i.echeance||null,
-    client:i.client, lines:i.lines, notes:i.notes, statut:i.statut,
+    client:i.client, client_id:i.clientId||null, lines:i.lines, notes:i.notes, statut:i.statut,
     total_ht:i.totalHT, total_tva:i.totalTVA, total_ttc:i.totalTTC
   };
 }
@@ -306,23 +320,66 @@ function achatToDb(a){
   };
 }
 
+/* ---------- Authentification (Supabase Auth) ---------- */
+async function authLogin(email, password){
+  const res = await fetch(SUPABASE_AUTH_URL+'token?grant_type=password', {
+    method:'POST',
+    headers:{ 'apikey':SUPABASE_KEY, 'Content-Type':'application/json' },
+    body: JSON.stringify({email, password})
+  });
+  const data = await res.json();
+  if(!res.ok){ throw new Error(data.error_description || data.msg || 'Identifiants invalides.'); }
+  authState.accessToken = data.access_token;
+  authState.user = { id: data.user.id, email: data.user.email };
+}
+
+async function fetchMyProfile(){
+  const rows = await sbGet('profiles', 'select=*&id=eq.'+authState.user.id);
+  if(!rows || !rows[0]){
+    throw new Error("Aucun profil trouvé pour ce compte. Un administrateur doit d'abord créer votre profil (rôle) dans la base.");
+  }
+  authState.profile = {
+    id: rows[0].id, role: rows[0].role, clientId: rows[0].client_id,
+    fullName: rows[0].full_name||'', email: rows[0].email||authState.user.email
+  };
+  if(authState.profile.role==='client' && authState.profile.clientId){
+    const crows = await sbGet('clients', 'select=*&id=eq.'+authState.profile.clientId);
+    authState.myClient = crows && crows[0] ? clientFromDb(crows[0]) : null;
+  }
+}
+
+function authLogout(){
+  authState = { accessToken:null, user:null, profile:null, myClient:null };
+  state = { company:{...defaultCompany}, clients:[], invoices:[], achats:[] };
+  activeView = 'dashboard';
+  venteMode = 'list';
+  editingInvoiceId = null;
+  dbError = null;
+  showLogin();
+}
+
 async function loadAll(){
   try{
-    const [c, cl, inv, ach] = await Promise.all([
+    const role = authState.profile ? authState.profile.role : null;
+    const [c, cl, inv] = await Promise.all([
       sbGet('company_settings', 'select=*&id=eq.1'),
       sbGet('clients', 'select=*&order=nom.asc'),
       sbGet('invoices', 'select=*&order=date.desc'),
-      sbGet('achats', 'select=*&order=date.desc'),
     ]);
     if(c && c[0]) state.company = companyFromDb(c[0]);
-    else { await sbUpsert('company_settings', companyToDb(state.company), 'id'); }
+    else if(role==='admin'){ try{ await sbUpsert('company_settings', companyToDb(state.company), 'id'); }catch(e){ console.warn(e); } }
     state.clients = (cl||[]).map(clientFromDb);
     state.invoices = (inv||[]).map(invoiceFromDb);
-    state.achats = (ach||[]).map(achatFromDb);
+    if(role==='admin' || role==='accountant'){
+      const ach = await sbGet('achats', 'select=*&order=date.desc');
+      state.achats = (ach||[]).map(achatFromDb);
+    } else {
+      state.achats = [];
+    }
     dbError = null;
   }catch(e){
     console.error(e);
-    dbError = "Connexion à la base de données impossible. Vérifiez que les tables Supabase sont créées (voir console) — l'application fonctionne en mode local temporaire.";
+    dbError = "Connexion à la base de données impossible. Vérifiez que les tables et policies Supabase sont bien créées (voir console).";
   }
   ready = true;
 }
@@ -341,21 +398,35 @@ function fmtDate(iso){
 /* ============================================================
    SIDEBAR / NAV
 ============================================================ */
+function roleLabel(role){
+  return {admin:'Administrateur', accountant:'Comptable', client:'Client'}[role] || role;
+}
 function renderSidebar(){
   const c = state.company;
   document.getElementById('sidebarCompanyCard').innerHTML = `
     <div class="cn">${escapeHtml(c.raisonSociale || 'Votre société')}</div>
     <div class="ci">ICE ${escapeHtml(c.ice || '—')}</div>
   `;
+  const role = authState.profile ? authState.profile.role : null;
   const nav = document.getElementById('navList');
-  nav.innerHTML = VIEWS.map(v => `
+  nav.innerHTML = viewsForRole(role).map(v => `
     <button class="nav-item ${activeView===v.id?'active':''}" data-view="${v.id}">
       <span class="ic">${v.ic}</span><span>${v.label}</span>
     </button>
   `).join('');
   nav.querySelectorAll('.nav-item').forEach(btn=>{
-    btn.addEventListener('click', ()=>{ activeView = btn.dataset.view; render(); });
+    btn.addEventListener('click', ()=>{ activeView = btn.dataset.view; venteMode='list'; editingInvoiceId=null; render(); });
   });
+  const foot = document.getElementById('sidebarFoot');
+  if(foot){
+    foot.innerHTML = `
+      <div style="font-size:12px; font-weight:600; color:#e5e9f0;">${escapeHtml(authState.profile ? (authState.profile.fullName || authState.profile.email) : '')}</div>
+      <div style="font-size:10.5px; color:#93a1b5; margin-bottom:8px;">${escapeHtml(roleLabel(role))}</div>
+      <button class="btn btn-sm no-print" id="btnLogout" style="width:100%;">Se déconnecter</button>
+    `;
+    const lb = document.getElementById('btnLogout');
+    if(lb) lb.addEventListener('click', authLogout);
+  }
 }
 
 function escapeHtml(s){
@@ -366,6 +437,10 @@ function escapeHtml(s){
    ROUTER
 ============================================================ */
 function render(){
+  const role = authState.profile ? authState.profile.role : null;
+  const allowedIds = viewsForRole(role).map(v=>v.id);
+  if(!allowedIds.includes(activeView)) activeView = allowedIds[0] || 'dashboard';
+
   renderSidebar();
   const main = document.getElementById('main');
   let html = '';
@@ -453,7 +528,7 @@ function viewDashboard(){
     <div class="card">
       <div class="section-title" style="justify-content:space-between;">
         <h3>Factures récentes</h3>
-        <button class="btn btn-primary btn-sm no-print" data-goto="vente">+ Nouvelle facture</button>
+        ${(authState.profile && authState.profile.role!=='accountant') ? `<button class="btn btn-primary btn-sm no-print" data-goto="vente">+ Nouvelle facture</button>` : ''}
       </div>
       ${recent.length===0 ? emptyState('Aucune facture pour le moment', "Créez votre première facture de vente pour voir apparaître l'activité ici.") : `
       <table>
@@ -488,17 +563,24 @@ function statutBadge(s){
 ============================================================ */
 let venteMode = 'list'; // 'list' | 'form'
 let draftInvoice = null;
+let editingInvoiceId = null; // set when the form is editing an existing invoice instead of creating one
 
 function newDraft(){
-  return {
+  const d = {
     number: nextInvoiceNumber(),
     date: todayISO(),
     echeance: '',
     client: {nom:'', ice:'', if_:'', adresse:''},
+    clientId: null,
     lines: [ {designation:'', qty:1, puht:0, tva:20} ],
     notes: '',
     statut: 'En attente'
   };
+  if(authState.profile && authState.profile.role==='client' && authState.myClient){
+    d.client = {...authState.myClient};
+    d.clientId = authState.myClient.id;
+  }
+  return d;
 }
 function nextInvoiceNumber(){
   const year = new Date().getFullYear();
@@ -508,12 +590,14 @@ function nextInvoiceNumber(){
 
 function viewVenteList(){
   if(venteMode==='form'){ return viewVenteForm(); }
+  const role = authState.profile ? authState.profile.role : null;
+  const isClient = role==='client';
   const invs = [...state.invoices].sort((a,b)=>b.date.localeCompare(a.date));
   return `
     <div class="page-head row-between">
       <div>
-        <h1>Facture de vente</h1>
-        <p>Créez et gérez les factures émises à vos clients.</p>
+        <h1>${isClient ? 'Mes factures' : 'Facture de vente'}</h1>
+        <p>${isClient ? 'Consultez et gérez les factures qui vous ont été émises.' : 'Créez et gérez les factures émises à vos clients.'}</p>
       </div>
       <button class="btn btn-primary" id="btnNewInvoice">+ Nouvelle facture</button>
     </div>
@@ -542,7 +626,7 @@ function viewVenteList(){
 function bindVenteList(){
   bindGlobalNavButtons();
   const nb = document.getElementById('btnNewInvoice');
-  if(nb) nb.addEventListener('click', ()=>{ draftInvoice = newDraft(); venteMode='form'; render(); });
+  if(nb) nb.addEventListener('click', ()=>{ draftInvoice = newDraft(); editingInvoiceId = null; venteMode='form'; render(); });
   main_qsa('[data-view-inv]').forEach(b=>{
     b.addEventListener('click', ()=> openInvoiceModal(state.invoices.find(i=>i.id===b.dataset.viewInv)) );
   });
@@ -550,10 +634,13 @@ function bindVenteList(){
 
 function viewVenteForm(){
   const d = draftInvoice;
+  const role = authState.profile ? authState.profile.role : null;
+  const clientLocked = role==='client';
+  const isEditing = !!editingInvoiceId;
   return `
     <div class="page-head row-between">
       <div>
-        <h1>Nouvelle facture de vente</h1>
+        <h1>${isEditing ? 'Modifier la facture' : 'Nouvelle facture de vente'}</h1>
         <p>N° ${d.number} — les champs ICE et IF client sont recommandés pour la conformité fiscale.</p>
       </div>
       <button class="btn btn-ghost" id="btnCancelForm">&larr; Retour à la liste</button>
@@ -573,13 +660,14 @@ function viewVenteForm(){
     <div class="card" style="margin-bottom:18px;">
       <div class="section-title"><div class="num">2</div><h3>Client</h3></div>
       <div class="modal-body">
+        ${clientLocked ? `<div style="font-size:12.5px; color:var(--muted); margin-bottom:12px;">Vos factures sont automatiquement associées à votre compte client.</div>` : ''}
         <div class="grid2">
-          <div class="field"><label>Raison sociale / Nom du client *</label><input id="f_cnom" value="${escapeHtml(d.client.nom)}" placeholder="Ex. Société Beta SARL"></div>
-          <div class="field"><label>ICE client</label><input id="f_cice" value="${escapeHtml(d.client.ice)}" placeholder="15 chiffres"></div>
-          <div class="field"><label>Identifiant fiscal (IF) client</label><input id="f_cif" value="${escapeHtml(d.client.if_)}"></div>
-          <div class="field"><label>Adresse client</label><input id="f_cadr" value="${escapeHtml(d.client.adresse)}"></div>
+          <div class="field"><label>Raison sociale / Nom du client *</label><input id="f_cnom" value="${escapeHtml(d.client.nom)}" placeholder="Ex. Société Beta SARL" ${clientLocked?'disabled':''}></div>
+          <div class="field"><label>ICE client</label><input id="f_cice" value="${escapeHtml(d.client.ice)}" placeholder="15 chiffres" ${clientLocked?'disabled':''}></div>
+          <div class="field"><label>Identifiant fiscal (IF) client</label><input id="f_cif" value="${escapeHtml(d.client.if_)}" ${clientLocked?'disabled':''}></div>
+          <div class="field"><label>Adresse client</label><input id="f_cadr" value="${escapeHtml(d.client.adresse)}" ${clientLocked?'disabled':''}></div>
         </div>
-        ${state.clients.length ? `<div class="field"><label>Ou sélectionner un client existant</label>
+        ${(!clientLocked && state.clients.length) ? `<div class="field"><label>Ou sélectionner un client existant</label>
           <select id="f_clientPick"><option value="">— choisir —</option>${state.clients.map((c,idx)=>`<option value="${idx}">${escapeHtml(c.nom)}</option>`).join('')}</select></div>` : ''}
       </div>
     </div>
@@ -609,7 +697,7 @@ function viewVenteForm(){
     </div>
 
     <div style="display:flex; gap:10px;">
-      <button class="btn btn-primary" id="btnSaveInvoice">Enregistrer la facture</button>
+      <button class="btn btn-primary" id="btnSaveInvoice">${isEditing ? 'Enregistrer les modifications' : 'Enregistrer la facture'}</button>
       <button class="btn btn-ghost" id="btnCancelForm2">Annuler</button>
     </div>
   `;
@@ -668,8 +756,8 @@ function renderTotals(){
 }
 
 function bindVenteForm(){
-  document.getElementById('btnCancelForm').addEventListener('click', ()=>{ venteMode='list'; render(); });
-  document.getElementById('btnCancelForm2').addEventListener('click', ()=>{ venteMode='list'; render(); });
+  document.getElementById('btnCancelForm').addEventListener('click', ()=>{ venteMode='list'; editingInvoiceId=null; render(); });
+  document.getElementById('btnCancelForm2').addEventListener('click', ()=>{ venteMode='list'; editingInvoiceId=null; render(); });
   document.getElementById('btnAddLine').addEventListener('click', ()=>{
     draftInvoice.lines.push({designation:'',qty:1,puht:0,tva:20});
     renderLines(); renderTotals();
@@ -677,7 +765,7 @@ function bindVenteForm(){
   document.getElementById('f_number').addEventListener('input', e=> draftInvoice.number = e.target.value);
   document.getElementById('f_date').addEventListener('input', e=> draftInvoice.date = e.target.value);
   document.getElementById('f_echeance').addEventListener('input', e=> draftInvoice.echeance = e.target.value);
-  document.getElementById('f_cnom').addEventListener('input', e=> draftInvoice.client.nom = e.target.value);
+  document.getElementById('f_cnom').addEventListener('input', e=>{ draftInvoice.client.nom = e.target.value; draftInvoice.clientId = null; });
   document.getElementById('f_cice').addEventListener('input', e=> draftInvoice.client.ice = e.target.value);
   document.getElementById('f_cif').addEventListener('input', e=> draftInvoice.client.if_ = e.target.value);
   document.getElementById('f_cadr').addEventListener('input', e=> draftInvoice.client.adresse = e.target.value);
@@ -686,7 +774,8 @@ function bindVenteForm(){
   if(pick) pick.addEventListener('change', e=>{
     if(e.target.value===''){ return; }
     const c = state.clients[Number(e.target.value)];
-    draftInvoice.client = {...c};
+    draftInvoice.client = {nom:c.nom, ice:c.ice, if_:c.if_, adresse:c.adresse};
+    draftInvoice.clientId = c.id;
     venteMode='form'; render();
   });
   document.getElementById('btnSaveInvoice').addEventListener('click', saveInvoice);
@@ -701,26 +790,41 @@ async function saveInvoice(){
   const t = computeTotals(d);
   const invoice = {
     number: d.number, date: d.date, echeance: d.echeance,
-    client: {...d.client}, lines: d.lines.map(l=>({...l})),
+    client: {...d.client}, clientId: d.clientId || null, lines: d.lines.map(l=>({...l})),
     notes: d.notes, statut: d.statut,
     totalHT: t.totalHT, totalTVA: t.totalTVA, totalTTC: t.totalTTC
   };
   const saveBtn = document.getElementById('btnSaveInvoice');
   saveBtn.disabled = true; saveBtn.textContent = 'Enregistrement…';
   try{
-    const rows = await sbInsert('invoices', [invoiceToDb(invoice)]);
-    invoice.id = rows[0].id;
-    state.invoices.push(invoice);
-    if(d.client.nom.trim() && !state.clients.some(c=>c.nom===d.client.nom)){
-      const crows = await sbInsert('clients', [clientToDb(d.client)]);
-      state.clients.push(clientFromDb(crows[0]));
+    // resolve or create the client record so client_id is always set when possible
+    if(!invoice.clientId && invoice.client.nom.trim()){
+      const existing = state.clients.find(c=>c.nom===invoice.client.nom);
+      if(existing){ invoice.clientId = existing.id; }
+      else{
+        const crows = await sbInsert('clients', [clientToDb(invoice.client)]);
+        const newClient = clientFromDb(crows[0]);
+        state.clients.push(newClient);
+        invoice.clientId = newClient.id;
+      }
     }
+    if(editingInvoiceId){
+      const rows = await sbUpdate('invoices', 'id=eq.'+editingInvoiceId, invoiceToDb(invoice));
+      invoice.id = editingInvoiceId;
+      const idx = state.invoices.findIndex(i=>i.id===editingInvoiceId);
+      if(idx>-1) state.invoices[idx] = invoice; else state.invoices.push(invoice);
+    } else {
+      const rows = await sbInsert('invoices', [invoiceToDb(invoice)]);
+      invoice.id = rows[0].id;
+      state.invoices.push(invoice);
+    }
+    editingInvoiceId = null;
     venteMode = 'list';
     render();
   }catch(e){
     console.error(e);
     alert("Impossible d'enregistrer la facture dans la base de données. Vérifiez que la table 'invoices' existe dans Supabase.\n\n"+e.message);
-    saveBtn.disabled = false; saveBtn.textContent = 'Enregistrer la facture';
+    saveBtn.disabled = false; saveBtn.textContent = editingInvoiceId ? 'Enregistrer les modifications' : 'Enregistrer la facture';
   }
 }
 
@@ -730,18 +834,24 @@ async function saveInvoice(){
 function openInvoiceModal(inv){
   if(!inv) return;
   const c = state.company;
+  const role = authState.profile ? authState.profile.role : null;
+  const canEdit = role==='admin' || role==='client';
+  const canManageStatus = role==='admin';
+  const canDelete = role==='admin';
   const root = document.getElementById('modalRoot');
   root.innerHTML = `
     <div class="modal-bg" id="modalBg">
       <div class="modal">
         <div class="modal-head no-print">
           <div style="font-weight:700;">Aperçu — ${inv.number}</div>
-          <div style="display:flex; gap:8px;">
-            <button class="btn btn-sm" id="btnPrintInv">Imprimer / PDF</button>
-            <select class="btn-sm" id="statutPick" style="border-radius:8px;border:1px solid var(--border);padding:6px 10px;">
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-sm" id="btnDownloadPdf">Télécharger PDF</button>
+            <button class="btn btn-sm" id="btnPrintInv">Imprimer</button>
+            ${canEdit ? `<button class="btn btn-sm" id="btnEditInv">Modifier</button>` : ''}
+            ${canManageStatus ? `<select class="btn-sm" id="statutPick" style="border-radius:8px;border:1px solid var(--border);padding:6px 10px;">
               ${['En attente','Payée','En retard','Annulée'].map(s=>`<option value="${s}" ${s===inv.statut?'selected':''}>${s}</option>`).join('')}
-            </select>
-            <button class="btn btn-sm btn-danger" id="btnDeleteInv">Supprimer</button>
+            </select>` : ''}
+            ${canDelete ? `<button class="btn btn-sm btn-danger" id="btnDeleteInv">Supprimer</button>` : ''}
             <button class="close-x" id="btnCloseModal">&times;</button>
           </div>
         </div>
@@ -796,7 +906,22 @@ function openInvoiceModal(inv){
   document.getElementById('btnCloseModal').addEventListener('click', ()=> root.innerHTML='');
   document.getElementById('modalBg').addEventListener('click', e=>{ if(e.target.id==='modalBg') root.innerHTML=''; });
   document.getElementById('btnPrintInv').addEventListener('click', ()=> window.print());
-  document.getElementById('statutPick').addEventListener('change', async e=>{
+  document.getElementById('btnDownloadPdf').addEventListener('click', ()=> downloadInvoicePdf(inv));
+  const editBtn = document.getElementById('btnEditInv');
+  if(editBtn) editBtn.addEventListener('click', ()=>{
+    draftInvoice = {
+      number: inv.number, date: inv.date, echeance: inv.echeance||'',
+      client: {...inv.client}, clientId: inv.clientId||null,
+      lines: inv.lines.map(l=>({...l})), notes: inv.notes||'', statut: inv.statut
+    };
+    editingInvoiceId = inv.id;
+    venteMode = 'form';
+    root.innerHTML = '';
+    activeView = 'vente';
+    render();
+  });
+  const statutPick = document.getElementById('statutPick');
+  if(statutPick) statutPick.addEventListener('change', async e=>{
     const newStatut = e.target.value;
     try{
       await sbUpdate('invoices', 'id=eq.'+inv.id, {statut:newStatut});
@@ -804,7 +929,8 @@ function openInvoiceModal(inv){
       render();
     }catch(err){ console.error(err); alert("Impossible de mettre à jour le statut.\n"+err.message); }
   });
-  document.getElementById('btnDeleteInv').addEventListener('click', async ()=>{
+  const deleteBtn = document.getElementById('btnDeleteInv');
+  if(deleteBtn) deleteBtn.addEventListener('click', async ()=>{
     if(confirm('Supprimer définitivement cette facture ?')){
       try{
         await sbDelete('invoices', 'id=eq.'+inv.id);
@@ -815,23 +941,83 @@ function openInvoiceModal(inv){
   });
 }
 
+/* ---------- Téléchargement PDF (jsPDF) ---------- */
+function downloadInvoicePdf(inv){
+  if(!window.jspdf){ alert("La librairie de génération PDF n'a pas pu être chargée."); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'mm', format:'a4' });
+  const c = state.company;
+  let y = 20;
+
+  doc.setFontSize(14); doc.setFont(undefined,'bold');
+  doc.text(c.raisonSociale||'', 14, y);
+  doc.setFontSize(16);
+  doc.text('FACTURE', 150, y);
+
+  doc.setFont(undefined,'normal'); doc.setFontSize(9);
+  y += 6;
+  [c.adresse, `ICE ${c.ice||''} — RC ${c.rc||''} ${c.rcVille||''}`, `IF ${c.ifiscal||''} — Patente ${c.patente||''}${c.cnss?(' — CNSS '+c.cnss):''}`]
+    .forEach(l=>{ doc.text(l||'', 14, y); y += 5; });
+
+  doc.text(`N° ${inv.number}`, 150, 26);
+  doc.text(`Date : ${fmtDate(inv.date)}`, 150, 31);
+  if(inv.echeance) doc.text(`Échéance : ${fmtDate(inv.echeance)}`, 150, 36);
+
+  y += 6; doc.setDrawColor(200); doc.line(14, y, 196, y); y += 7;
+
+  doc.setFont(undefined,'bold'); doc.text('Facturé à :', 14, y); y += 5;
+  doc.setFont(undefined,'normal');
+  doc.text(inv.client.nom||'', 14, y); y += 5;
+  if(inv.client.adresse){ doc.text(inv.client.adresse, 14, y); y += 5; }
+  if(inv.client.ice || inv.client.if_){ doc.text(`ICE ${inv.client.ice||''} ${inv.client.if_?('— IF '+inv.client.if_):''}`, 14, y); y += 5; }
+
+  y += 6;
+  doc.setFont(undefined,'bold');
+  doc.text('Désignation', 14, y); doc.text('Qté', 112, y); doc.text('PU HT', 130, y); doc.text('TVA', 155, y); doc.text('Montant HT', 168, y);
+  y += 2; doc.line(14, y, 196, y); y += 5;
+  doc.setFont(undefined,'normal');
+  inv.lines.forEach(l=>{
+    doc.text(String(l.designation||''), 14, y, {maxWidth:95});
+    doc.text(String(l.qty), 112, y);
+    doc.text(fmtMAD(l.puht), 130, y);
+    doc.text(l.tva+'%', 155, y);
+    doc.text(fmtMAD(l.qty*l.puht), 168, y);
+    y += 6;
+  });
+
+  y += 4; doc.line(120, y, 196, y); y += 6;
+  doc.text('Total HT', 130, y); doc.text(fmtMAD(inv.totalHT), 168, y); y += 6;
+  doc.text('Total TVA', 130, y); doc.text(fmtMAD(inv.totalTVA), 168, y); y += 6;
+  doc.setFont(undefined,'bold');
+  doc.text('Total TTC', 130, y); doc.text(fmtMAD(inv.totalTTC), 168, y);
+
+  if(inv.notes){
+    y += 14; doc.setFont(undefined,'normal'); doc.setFontSize(8);
+    doc.text(doc.splitTextToSize(inv.notes, 180), 14, y);
+  }
+
+  doc.save(`${inv.number}.pdf`);
+}
+
 /* ============================================================
    GED — FACTURES D'ACHAT
 ============================================================ */
 let achatFormOpen = false;
 
 function viewAchat(){
+  const role = authState.profile ? authState.profile.role : null;
+  const readOnly = role==='accountant';
   const list = [...state.achats].sort((a,b)=>b.date.localeCompare(a.date));
   return `
     <div class="page-head row-between">
       <div>
         <h1>GED — Factures d'achat</h1>
-        <p>Enregistrez les factures fournisseurs reçues (saisie manuelle ou intégration OCR à venir).</p>
+        <p>${readOnly ? "Consultez les factures fournisseurs enregistrées." : "Enregistrez les factures fournisseurs reçues (saisie manuelle ou intégration OCR à venir)."}</p>
       </div>
-      <button class="btn btn-primary" id="btnNewAchat">+ Ajouter une facture d'achat</button>
+      ${readOnly ? '' : `<button class="btn btn-primary" id="btnNewAchat">+ Ajouter une facture d'achat</button>`}
     </div>
 
-    ${achatFormOpen ? `
+    ${(achatFormOpen && !readOnly) ? `
     <div class="card" style="margin-bottom:18px;">
       <div class="section-title"><h3>Nouvelle facture d'achat</h3></div>
       <div class="modal-body">
@@ -855,7 +1041,7 @@ function viewAchat(){
     <div class="card">
       ${list.length===0 ? emptyState("Aucune facture d'achat", 'Ajoutez vos factures fournisseurs pour suivre vos charges déductibles.') : `
       <table>
-        <thead><tr><th>Fournisseur</th><th>N° facture</th><th>Date</th><th>Montant TTC</th><th>Document</th><th>Statut</th><th></th></tr></thead>
+        <thead><tr><th>Fournisseur</th><th>N° facture</th><th>Date</th><th>Montant TTC</th><th>Document</th><th>Statut</th>${readOnly?'':'<th></th>'}</tr></thead>
         <tbody>
           ${list.map(a=>`
             <tr>
@@ -865,7 +1051,7 @@ function viewAchat(){
               <td>${fmtMAD(a.montantTTC)}</td>
               <td>${a.fichier ? '&#128206; '+escapeHtml(a.fichier) : '—'}</td>
               <td>${achatBadge(a.statut)}</td>
-              <td><button class="btn btn-ghost btn-sm" data-del-achat="${a.id}">Supprimer</button></td>
+              ${readOnly ? '' : `<td><button class="btn btn-ghost btn-sm" data-del-achat="${a.id}">Supprimer</button></td>`}
             </tr>
           `).join('')}
         </tbody>
@@ -1126,12 +1312,69 @@ function bindParametres(){
 }
 
 /* ============================================================
+   ÉCRAN DE CONNEXION
+============================================================ */
+const SHELL_TEMPLATE = document.getElementById('shell').innerHTML;
+let loginErrorMsg = '';
+let loginLoading = false;
+
+function showLogin(){
+  document.getElementById('shell').innerHTML = `
+    <div style="width:100%; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--cream);">
+      <div class="card" style="width:100%; max-width:380px; padding:30px 28px;">
+        <div style="display:flex; gap:9px; align-items:center; margin-bottom:22px;">
+          <div style="width:30px;height:30px;border-radius:6px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;">F</div>
+          <div>
+            <div style="font-weight:700; font-size:15px;">Factura</div>
+            <div style="font-size:11px; color:var(--muted);">Module facturation</div>
+          </div>
+        </div>
+        <div class="field"><label>Email</label><input id="loginEmail" type="email" placeholder="vous@exemple.com" autocomplete="username"></div>
+        <div class="field"><label>Mot de passe</label><input id="loginPassword" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        ${loginErrorMsg ? `<div style="background:var(--danger-soft); color:var(--danger); border-radius:6px; padding:9px 11px; font-size:12.5px; margin-bottom:14px;">${escapeHtml(loginErrorMsg)}</div>` : ''}
+        <button class="btn btn-primary" id="btnLogin" style="width:100%; justify-content:center;" ${loginLoading?'disabled':''}>${loginLoading?'Connexion…':'Se connecter'}</button>
+        <div style="font-size:11.5px; color:var(--muted); margin-top:16px; text-align:center;">
+          Accès administrateur, comptable ou client — selon le compte configuré par votre société.
+        </div>
+      </div>
+    </div>
+  `;
+  const btn = document.getElementById('btnLogin');
+  const emailInput = document.getElementById('loginEmail');
+  const passInput = document.getElementById('loginPassword');
+  const doLogin = ()=> attemptLogin(emailInput.value.trim(), passInput.value);
+  btn.addEventListener('click', doLogin);
+  passInput.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+}
+
+async function attemptLogin(email, password){
+  if(!email || !password){ loginErrorMsg = 'Merci de renseigner email et mot de passe.'; showLogin(); return; }
+  loginLoading = true; loginErrorMsg=''; showLogin();
+  try{
+    await authLogin(email, password);
+    await fetchMyProfile();
+    showApp();
+    await loadAll();
+    render();
+  }catch(e){
+    console.error(e);
+    loginErrorMsg = e.message || 'Connexion impossible.';
+    authState = { accessToken:null, user:null, profile:null, myClient:null };
+  }finally{
+    loginLoading = false;
+    if(!authState.accessToken) showLogin();
+  }
+}
+
+function showApp(){
+  document.getElementById('shell').innerHTML = SHELL_TEMPLATE;
+}
+
+/* ============================================================
    INIT
 ============================================================ */
-(async function init(){
-  await loadAll();
-  render();
-})();
+showLogin();
+
 </script>
 </body>
 </html>
